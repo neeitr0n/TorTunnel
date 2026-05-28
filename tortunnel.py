@@ -5,7 +5,8 @@ import socket
 import subprocess
 import sys
 import time
-import requests
+import urllib.request
+import urllib.error
 
 TOR_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051 
@@ -74,10 +75,16 @@ def is_tor_responsive():
 
 def is_connection_alive(target_url="http://1.1.1.1", timeout=4):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/21000101 Firefox/115.0"}
-        response = requests.head(target_url, timeout=timeout)
-        return response.status_code < 400
-    except requests.RequestException:
+        # Формируем объект запроса и явно указываем метод HEAD
+        req = urllib.request.Request(
+            target_url, 
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/21000101 Firefox/115.0"},
+            method="HEAD"
+        )
+        # Открываем соединение внутри контекстного менеджера с таймаутом
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status < 400
+    except (urllib.error.URLError, Exception):
         return False
 
 def setup_traffic_tunnel():
