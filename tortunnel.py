@@ -10,6 +10,7 @@ import urllib.error
 
 TOR_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051 
+TOR_SOCKS_PORT = 9050
 TOR_PASSWORD = ""
 
 TUNNEL_ACTIVATED = False
@@ -24,18 +25,88 @@ def run_command(cmd_list, suppress_errors=False):
             stderr=subprocess.PIPE
         )
         return True
-
     except subprocess.CalledProcessError as e:
         if not suppress_errors:
-            print(f"[-] Command execution failed: {' '.join(cmd_list)} | Error: "
-                  f"{e.stderr.decode().strip()}")
+            print(f"[-] Command execution failed: {' '.join(cmd_list)} | Error: {e.stderr.decode().strip()}")
         return False
-
     except Exception as e:
         if not suppress_errors:
             print(f"[-] System error executing command {' '.join(cmd_list)}: {e}")
         return False
-               
+              
+def setup_torrc_config(torrc_path="/etc/tor/torrc"):
+    MARKER = "# === TorTunnel AutoConfig ==="
+    
+    try:
+        if not os.path.exists(torrc_path):
+            print(f"[-] Error: {torrc_path} not found.")
+            return False
+            
+        with open(torrc_path, 'r') as f:
+            content = f.read()
+            
+        if MARKER in content:
+            print("[+] Tor configuration marker found. Skipping auto-config.")
+            return True
+            
+        print("[*] Configuring torrc for TorTunnel...")
+        
+        backup_path = torrc_path + ".bak"
+        shutil.copyfile(torrc_path, backup_path)
+        print(f"[+] Backup successfully created at: {backup_path}")
+        
+        lines = content.splitlines()
+        cleaned_lines = []
+        conflicting_keys = [
+            "SOCKSPort", "TransPort", "DNSPort", "ControlPort", 
+            "MaxCircuitDirtiness", "NewCircuitPeriod", 
+            "EnforceDistinctSubnets", "VirtualAddrNetworkIPv4", "AutomapHostsOnResolve"
+        ]
+                            
+        for line in lines:
+            strip_line = line.strip()
+            if any(strip_line.startswith(key) for key in conflicting_keys) and not strip_line.startswith("#"):
+                cleaned_lines.append(f"# Commented out by TorTunnel to avoid conflict:\n# {line}")
+            else:
+                cleaned_lines.append(line)
+
+        config_block = (
+            f"\n{MARKER}\n"
+            "SOCKSPort 127.0.0.1:9050\n"
+            "TransPort 127.0.0.1:9040\n"
+            "DNSPort 127.0.0.1:5353\n"
+            "ControlPort 127.0.0.1:9051\n"
+            "MaxCircuitDirtiness 30\n"
+            "NewCircuitPeriod 15\n"
+            "EnforceDistinctSubnets 1\n"
+            "VirtualAddrNetworkIPv4 10.192.0.0/10\n"
+            "AutomapHostsOnResolve 1\n"
+            "UseBridges 1\n"
+            "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
+            "# === End TorTunnel AutoConfig ===\n"
+        )
+                       
+        new_content = "\n".join(cleaned_lines) + config_block
+        
+        with open(torrc_path, 'w') as f:
+            f.write(new_content)
+            
+        print("[+] torrc updated successfully. Applying changes...")
+        if run_command(["systemctl", "restart", "tor.service"]):
+            print("[+] Tor service restarted with new configuration.")
+            time.sleep(3)
+            return True
+        else:
+            print("[-] Failed to restart Tor service via systemctl.")
+            return False
+            
+    except PermissionError:
+        print("[-] Permission denied. Please run the script with sudo (needed to modify torrc).")
+        return False
+    except Exception as e:
+        print(f"[-] Error updating torrc: {e}")
+        return False
+
 def detect_firewall_backend():
     if shutil.which("nft"):
         return "nftables"
@@ -53,7 +124,7 @@ def detect_tor_user():
     except Exception:
         pass
         
-    for username in ["tor", "debian-tor", "tor-anonymity", "nobody"]:
+    for username in ["debian-tor", "tor", "tor-anonymity", "nobody"]:
         try:
             import pwd
             pwd.getpwnam(username)
@@ -62,29 +133,49 @@ def detect_tor_user():
             continue
     return "tor"
 
-def is_tor_responsive():
+def send_tor_control_command(command):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(3)
+            s.settimeout(5)
             s.connect((TOR_HOST, TOR_CONTROL_PORT))
             s.sendall(f'AUTHENTICATE "{TOR_PASSWORD}"\r\n'.encode('utf-8'))
             response = s.recv(1024).decode('utf-8')
-            return "250" in response
-    except Exception:
-        return False
+            if "250" not in response:
+                return None, f"Auth failed: {response.strip()}"
 
-def is_connection_alive(target_url="http://1.1.1.1", timeout=4):
+            s.sendall(f"{command}\r\n".encode('utf-8'))
+            response = s.recv(1024).decode('utf-8')
+            return response, None
+    except Exception as e:
+        return None, str(e)
+
+def is_tor_responsive():
+    res, _ = send_tor_control_command("PROTOCOLINFO 1")
+    return res is not None and "250" in res
+
+def wait_for_tor_circuit(timeout=90):
+    print("[*] Waiting for Tor to establish circuit status via bridges...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        res, _ = send_tor_control_command("GETINFO status/circuit-established")
+        if res and "status/circuit-established=1" in res:
+            print("[+] Tor network circuit is fully established!")
+            return True
+        time.sleep(3)
+    print("[-] Timeout waiting for Tor circuit.")
+    return False
+
+def is_connection_alive(target_url="http://1.1.1.1", timeout=12):
     try:
-        # Формируем объект запроса и явно указываем метод HEAD
         req = urllib.request.Request(
             target_url, 
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/21000101 Firefox/115.0"},
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0"},
             method="HEAD"
         )
-        # Открываем соединение внутри контекстного менеджера с таймаутом
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status < 400
-    except (urllib.error.URLError, Exception):
+    except Exception as e:
+        # print(f"[-] Connection check debug: {e}") 
         return False
 
 def setup_traffic_tunnel():
@@ -93,7 +184,6 @@ def setup_traffic_tunnel():
     print("[*] Checking subsystem readiness...")
     if not is_tor_responsive():
         print(f"[-] Critical Error: Tor daemon is not responding on port {TOR_CONTROL_PORT}!")
-        print("[!] Check if Tor is running and ControlPort is enabled. Script stopped, firewall unchanged.")
         sys.exit(1)
 
     FIREWALL_BACKEND = detect_firewall_backend()
@@ -105,14 +195,13 @@ def setup_traffic_tunnel():
     
     if FIREWALL_BACKEND == "nftables":
         print("[*] Applying rules for nftables...")
-        
         run_command(["nft", "delete", "table", "ip", "nat"], suppress_errors=True)
         run_command(["nft", "delete", "table", "ip", "filter"], suppress_errors=True)
         run_command(["nft", "delete", "table", "ip6", "filter"], suppress_errors=True)        
         commands = [
             ["nft", "add", "table", "ip", "nat"],
             ["nft", "add", "chain", "ip", "nat", "OUTPUT", "{", "type", "nat", "hook", "output", "priority", "filter", ";", "}"],  
-            ["nft", "add", "rule", "ip", "nat", "OUTPUT", "skuid", tor_user, "return"], # Allow Tor daemon native traffic
+            ["nft", "add", "rule", "ip", "nat", "OUTPUT", "skuid", tor_user, "return"],
             ["nft", "add", "rule", "ip", "nat", "OUTPUT", "ip", "daddr", "192.168.0.0/16", "return"],
             ["nft", "add", "rule", "ip", "nat", "OUTPUT", "udp", "dport", "53", "redirect", "to", ":5353"],
             ["nft", "add", "rule", "ip", "nat", "OUTPUT", "tcp", "dport", "53", "redirect", "to", ":5353"],
@@ -125,18 +214,16 @@ def setup_traffic_tunnel():
             ["nft", "add", "rule", "ip", "filter", "OUTPUT", "ip", "daddr", "192.168.0.0/16", "accept"],
             ["nft", "add", "rule", "ip", "filter", "OUTPUT", "oif", "lo", "accept"],
             ["nft", "add", "rule", "ip", "filter", "OUTPUT", "udp", "dport", "53", "accept"], 
-            ["nft", "add", "rule", "ip", "filter", "OUTPUT", "ip", "protocol", "udp", "drop"], # Block QUIC/UDP leaks
+            ["nft", "add", "rule", "ip", "filter", "OUTPUT", "ip", "protocol", "udp", "drop"],
 
             ["nft", "add", "table", "ip6", "filter"],
             ["nft", "add", "chain", "ip6", "filter", "OUTPUT", "{", "type", "filter", "hook", "output", "priority", "0", ";", "}"],
             ["nft", "add", "rule", "ip6", "filter", "OUTPUT", "drop"]
         ]
-    
     elif FIREWALL_BACKEND == "iptables":
         print("[*] Applying rules for iptables...")
-        run_command(["modprobe", "iptable_nat"])
-        run_command(["modprobe", "xt_REDIRECT"])
-
+        run_command(["modprobe", "iptable_nat"], suppress_errors=True)
+        run_command(["modprobe", "xt_REDIRECT"], suppress_errors=True)
         commands = [
             ["iptables", "-t", "nat", "-A", "OUTPUT", "-m", "owner", "--uid-owner", tor_user, "-j", "RETURN"],                
             ["iptables", "-t", "nat", "-A", "OUTPUT", "-d", "192.168.0.0/16", "-j", "RETURN"],
@@ -153,7 +240,6 @@ def setup_traffic_tunnel():
             
             ["ip6tables", "-P", "OUTPUT", "DROP"]
         ]
-    
     else:
         print("[-] Critical Error: No compatible firewall backend found!\n")
         sys.exit(1)    
@@ -170,120 +256,73 @@ def setup_traffic_tunnel():
 
 def clear_traffic_tunnel():
     global TUNNEL_ACTIVATED, FIREWALL_BACKEND
-
     if TUNNEL_ACTIVATED:
         print("="*65)
         print(f"[*] Deactivating tunnel: clearing {FIREWALL_BACKEND} rules...")
         if FIREWALL_BACKEND == "nftables":
-            run_command(["nft", "delete", "table", "ip", "nat"])
-            run_command(["nft", "delete", "table", "ip", "filter"])
-            run_command(["nft", "delete", "table", "ip6", "filter"])
+            run_command(["nft", "delete", "table", "ip", "nat"], suppress_errors=True)
+            run_command(["nft", "delete", "table", "ip", "filter"], suppress_errors=True)
+            run_command(["nft", "delete", "table", "ip6", "filter"], suppress_errors=True)
         elif FIREWALL_BACKEND == "iptables":
-            run_command(["iptables", "-t", "nat", "-F", "OUTPUT"])
-            run_command(["iptables", "-F", "OUTPUT"])
-            run_command(["ip6tables", "-P", "OUTPUT", "ACCEPT"])
-            run_command(["ip6tables", "-F", "OUTPUT"])
+            run_command(["iptables", "-t", "nat", "-F", "OUTPUT"], suppress_errors=True)
+            run_command(["iptables", "-F", "OUTPUT"], suppress_errors=True)
+            run_command(["ip6tables", "-P", "OUTPUT", "ACCEPT"], suppress_errors=True)
+            run_command(["ip6tables", "-F", "OUTPUT"], suppress_errors=True)
+        TUNNEL_ACTIVATED = False
         print("[+] Network successfully restored to its original state.")
         print("="*65+"\n")
-    else:
-        print("\n[*] No firewall modifications detected. Clean up skipped.")
 
-def request_ip_rotation(host=TOR_HOST, port=TOR_CONTROL_PORT, password=TOR_PASSWORD):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(5)
-            s.connect((host, port))
+def request_ip_rotation():
+    res, err = send_tor_control_command("SIGNAL NEWNYM")
+    if res and "250" in res:
+        print("[+] NEWNYM signal accepted. Tor circuit is updating.")
+        send_tor_control_command("SIGNAL CLEARDNSCACHE")
+        return True
+    print(f"[-] Tor rejected NEWNYM signal: {err}")
+    return False
 
-            auth_command = f'AUTHENTICATE "{password}"\r\n'.encode('utf-8')
-            s.sendall(auth_command)
+def start_automation_loop(check_interval=15):
+    if not setup_torrc_config():
+        print("[-] Initial Tor configuration failed. Exiting.")
+        return
 
-            response = s.recv(1024).decode('utf-8')
-            if "250" not in response:
-                print(f"[-] Authentication failed. Response: {response.strip()}")
-                return False
-
-            s.sendall(b"SIGNAL NEWNYM\r\n")
-            response_sig = s.recv(1024).decode('utf-8')
-            if "250" not in response_sig:
-                print(f"[-] Tor rejected NEWNYM signal: {response_sig.strip()}")
-                return False
-
-            s.sendall(b"SIGNAL CLEARDNSCACHE\r\n")
-            s.recv(1024)
-
-            print("[+] NEWNYM signal accepted. Tor circuit is updating.")
-            return True
-    except Exception as e:
-        print(f"[-] Socket error during rotation: {e}")
-        return False
-
-def start_automation_loop(min_interval, max_interval):
     os.system('cls' if os.name == 'nt' else 'clear')
-    print(""+"="*65)
-    print(f"[*] Launching TorTunnel. Interval: {min_interval}s to {max_interval}s.")
-    print("[*] Press Ctrl+C to stop\n" + "="*65)
+    print("="*65)
+    print("[*] Launching TorTunnel Watchdog Mode (Bridges Compatible).")
+    print(f"[*] Connection monitoring interval: every {check_interval} seconds.")
+    print("[*] Press Ctrl+C to stop and clear firewall rules\n" + "="*65)
     
+    wait_for_tor_circuit()
     setup_traffic_tunnel()
+    
+    print("\n[+] Tunnel is ACTIVE. Your traffic is now securely routed through Tor.")
+    print("[*] System status: Operational. Monitoring integrity...")
 
-    iteration = 1
     try:
         while True:
-            print(f"\n[Iteration #{iteration}] Requesting IP rotation...")
-
-            success = request_ip_rotation()
-            if success:
-                time.sleep(5)
+            time.sleep(check_interval)
+            
+            if not is_connection_alive():
+                timestamp = time.strftime('%H:%M:%S')
+                print(f"\n[{timestamp}] [!] Connection dropped! Initiating emergency recovery...")
                 
-                if not is_connection_alive():
-                    print("[!] Encounted a 'dead' or censored Tor node. Immediate re-rotation forced...")
-                    print("[*] Temporarily disabling tunnel to fetch fresh circuit configuration...")
-                    
-                    clear_traffic_tunnel()
-                    request_ip_rotation()
-
-                    print("[*] Waiting for Tor circuit rebuild via direct connection...")
-                    time.sleep(8)
-
-                    print("[*] Re-enabling firewall protection...")
+                clear_traffic_tunnel()
+                request_ip_rotation() 
+                
+                if wait_for_tor_circuit(timeout=90):
+                    time.sleep(5)
                     setup_traffic_tunnel()
-
-                    continue
-
-                sleep_time = random.randint(min_interval, max_interval)
-                forced_rotation = False
-                
-                seconds_passed = 0
-                for remaining in range(sleep_time, 0, -1):
-                    sys.stdout.write(f"\r[~] Next IP rotation in: {remaining}s...   ")
-                    sys.stdout.flush()
-                    time.sleep(1)
-                    seconds_passed += 1
+                    new_timestamp = time.strftime('%H:%M:%S')
+                    print(f"[{new_timestamp}] [+] Connection restored. Tunnel is ACTIVE again.")
+                else:
+                    print(f"[{time.strftime('%H:%M:%S')}] [-] Recovery failed. Retrying in next cycle...")
                     
-                    if seconds_passed > 5 and seconds_passed % 10 == 0:
-                        if not is_connection_alive():
-                            print("\n[!] Connection lost (Tor node died during standby)! Forcing rotation...")
-                            forced_rotation = True
-                            break
-                
-                if forced_rotation:
-                    print("[*] Triggering emergency tunnel reset for connection recovery...")
-                    clear_traffic_tunnel()
-                    request_ip_rotation()
-                    time.sleep(8)
-                    setup_traffic_tunnel()
-                    continue
-                    
-                sys.stdout.write("\r[+] Standby finished. Requesting new IP address...\n")
-                sys.stdout.flush()
-                iteration += 1
-            else:
-                print("[!] Unable to communicate with Tor. Retrying in 10 seconds...")
-                time.sleep(10)
-
     except KeyboardInterrupt:
-        print("\n[*] Automation stopped by user.\n")
+        print("\n\n[*] Automation stopped by user.")
     finally:
+        print("[*] Cleaning up firewall rules before exit...")
         clear_traffic_tunnel()
+        print("[+] System network restored to original state.")
 
 if __name__ == "__main__":
-    start_automation_loop(min_interval=15, max_interval=45)
+    start_automation_loop(check_interval=15)
