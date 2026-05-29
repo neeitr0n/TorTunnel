@@ -7,6 +7,8 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import hashlib
+import base64
 
 TOR_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051 
@@ -15,6 +17,14 @@ TOR_PASSWORD = ""
 
 TUNNEL_ACTIVATED = False
 FIREWALL_BACKEND = None
+
+BRIDGES_URL = "https://raw.githubusercontent.com/neeitr0n/TorTunnel-bridges/refs/heads/main/bridges_encoded.txt"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+HASH_FILE_PATH = os.path.join(SCRIPT_DIR, "bridges.hash")
+
+TORRC_PATH = "/etc/tor/torrc"
+START_MARKER = "# === TorTunnel AutoConfig ==="
+END_MARKER = "# === End TorTunnel AutoConfig ==="
 
 def run_command(cmd_list, suppress_errors=False):
     try:
@@ -33,45 +43,145 @@ def run_command(cmd_list, suppress_errors=False):
         if not suppress_errors:
             print(f"[-] System error executing command {' '.join(cmd_list)}: {e}")
         return False
+
+def load_local_hash():
+    if os.path.exists(HASH_FILE_PATH):
+        try:
+            with open(HASH_FILE_PATH, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return None
+    return None 
+
+def save_local_hash(new_hash):
+    try:
+        with open(HASH_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(new_hash)
+    except Exception as e:
+        print(f"[-] Warning: Failed to save bridge cache hash: {e}")
+
+def fetch_remote_bridges():
+    print("[*] Connecting to remote repository to verify bridge status...")
+    try:
+        req = urllib.request.Request(BRIDGES_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            encoded_content = response.read()
+
+        remote_hash = hashlib.sha256(encoded_content).hexdigest()
+        local_hash = load_local_hash()
+
+        if local_hash == remote_hash:
+            print("[+] Bridge database is up-to-date. No changes detected.")
+            return None, remote_hash
+
+        if local_hash is None:
+            print("[*] Initial launch or empty cache detected. Fetching bridges...")
+        else:
+            print("[!] Remote bridge database update detected! Syncing...")
+
+        decoded_bytes = base64.b64decode(encoded_content)
+        all_bridges = decoded_bytes.decode('utf-8').splitlines()
+        
+        valid_bridges = []
+        for b in all_bridges:
+            line = b.strip()
+
+            if not line.startswith("Bridge"):
+                continue
+
+            if "8.8.8.8" in line or "10.122." in line:
+                continue
+            valid_bridges.append(line)
+
+        if not valid_bridges:
+            print("[-] Error: Failed to parse valid bridge descriptors from the remote payload.")
+            return None, None
+
+        print(f"[+] Successfully decrypted and filtered {len(valid_bridges)} valid bridges into memory.")
+        return valid_bridges, remote_hash
+
+    except urllib.error.URLError as e:
+        print(f"[-] Network connection failure during bridge sync: {e.reason}")
+        return None, None
+    except Exception as e:
+        print(f"[-] Critical execution fault during bridge sync: {e}")
+        return None, None
               
-def setup_torrc_config(torrc_path="/etc/tor/torrc"):
-    MARKER = "# === TorTunnel AutoConfig ==="
-    
+def setup_torrc_config(torrc_path=TORRC_PATH):
     try:
         if not os.path.exists(torrc_path):
             print(f"[-] Error: {torrc_path} not found.")
             return False
             
-        with open(torrc_path, 'r') as f:
+        with open(torrc_path, 'r', encoding='utf-8') as f:
             content = f.read()
-            
-        if MARKER in content:
-            print("[+] Tor configuration marker found. Skipping auto-config.")
-            return True
-            
-        print("[*] Configuring torrc for TorTunnel...")
-        
-        backup_path = torrc_path + ".bak"
-        shutil.copyfile(torrc_path, backup_path)
-        print(f"[+] Backup successfully created at: {backup_path}")
-        
-        lines = content.splitlines()
-        cleaned_lines = []
-        conflicting_keys = [
-            "SOCKSPort", "TransPort", "DNSPort", "ControlPort", 
-            "MaxCircuitDirtiness", "NewCircuitPeriod", 
-            "EnforceDistinctSubnets", "VirtualAddrNetworkIPv4", "AutomapHostsOnResolve"
-        ]
-                            
-        for line in lines:
-            strip_line = line.strip()
-            if any(strip_line.startswith(key) for key in conflicting_keys) and not strip_line.startswith("#"):
-                cleaned_lines.append(f"# Commented out by TorTunnel to avoid conflict:\n# {line}")
+
+        if START_MARKER in content and END_MARKER in content:
+            print("[*] Found existing TorTunnel configuration block. Sanitizing...")
+            parts = content.split(START_MARKER)
+            before_block = parts[0]
+            after_block = parts[1].split(END_MARKER)[1]
+            clean_base_content = before_block.strip() + "\n" + after_block.strip()
+        else:
+            lines = content.splitlines()
+            cleaned_lines = []
+            conflicting_keys = [
+                "SOCKSPort", "TransPort", "DNSPort", "ControlPort", 
+                "MaxCircuitDirtiness", "NewCircuitPeriod", 
+                "EnforceDistinctSubnets", "VirtualAddrNetworkIPv4", "AutomapHostsOnResolve", "UseBridges"
+            ]
+            for line in lines:
+                strip_line = line.strip()
+                if any(strip_line.startswith(key) for key in conflicting_keys) and not strip_line.startswith("#"):
+                    cleaned_lines.append(f"# Commented out by TorTunnel to avoid conflict:\n# {line}")
+                else:
+                    cleaned_lines.append(line)
+            clean_base_content = "\n".join(cleaned_lines)
+
+            backup_path = torrc_path + ".bak"
+            shutil.copyfile(torrc_path, backup_path)
+            print(f"[+] Original torrc backup successfully created at: {backup_path}")
+
+        bridges_list, remote_hash = fetch_remote_bridges()
+
+        if bridges_list is not None:
+            save_local_hash(remote_hash)
+        else:
+            if START_MARKER in content:
+                block_content = content.split(START_MARKER)[1].split(END_MARKER)[0]
+                bridges_list = []
+                for line in block_content.splitlines():
+                    line_s = line.strip()
+                    if line_s.startswith("Bridge obfs4"):
+                        bridges_list.append(line_s)
+                    elif line_s.startswith("# Bridge obfs4"):
+                        cleaned_bridge = line_s.replace("# [Active] ", "").replace("# ", "", 1)
+                        if cleaned_bridge.startswith("Bridge obfs4"):
+                            bridges_list.append(cleaned_bridge)
             else:
-                cleaned_lines.append(line)
+                bridges_list = []
+
+        bridges_section_lines = ["\n# --- AUTOMATICALLY MANAGED POOL ---"]
+        if bridges_list:
+            count_to_select = random.randint(5, 10)
+            active_bridges = random.sample(bridges_list, min(count_to_select, len(bridges_list)))
+            active_set = set(active_bridges)
+
+            for bridge in bridges_list:
+                if bridge in active_set:
+                    # Оставляем активным для Tor
+                    bridges_section_lines.append(bridge)
+                else:
+                    # Остальные комментируем, чтобы Tor их не опрашивал при старте
+                    bridges_section_lines.append(f"# {bridge}")
+            
+            bridges_section = "\n" + "\n".join(bridges_section_lines)
+            print(f"[+] Activated {len(active_set)} random bridges. {len(bridges_list) - len(active_set)} backup bridges are commented out.")
+        else:
+            bridges_section = ""
 
         config_block = (
-            f"\n{MARKER}\n"
+            f"\n{START_MARKER}\n"
             "SOCKSPort 127.0.0.1:9050\n"
             "TransPort 127.0.0.1:9040\n"
             "DNSPort 127.0.0.1:5353\n"
@@ -82,14 +192,15 @@ def setup_torrc_config(torrc_path="/etc/tor/torrc"):
             "VirtualAddrNetworkIPv4 10.192.0.0/10\n"
             "AutomapHostsOnResolve 1\n"
             "UseBridges 1\n"
-            "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
-            "# === End TorTunnel AutoConfig ===\n"
+            "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy"
+            f"{bridges_section}\n"
+            f"{END_MARKER}\n"
         )
                        
-        new_content = "\n".join(cleaned_lines) + config_block
-        
-        with open(torrc_path, 'w') as f:
-            f.write(new_content)
+        final_content = clean_base_content.strip() + "\n" + config_block
+
+        with open(torrc_path, 'w', encoding='utf-8') as f:
+            f.write(final_content)
             
         print("[+] torrc updated successfully. Applying changes...")
         if run_command(["systemctl", "restart", "tor.service"]):
@@ -106,6 +217,40 @@ def setup_torrc_config(torrc_path="/etc/tor/torrc"):
     except Exception as e:
         print(f"[-] Error updating torrc: {e}")
         return False
+
+def restore_all_bridges_in_torrc(torrc_path=TORRC_PATH):
+    print("[*] Restoring all backup bridges in torrc (uncommenting)...")
+    try:
+        if not os.path.exists(torrc_path):
+            return
+            
+        with open(torrc_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if START_MARKER in content and END_MARKER in content:
+            parts = content.split(START_MARKER)
+            before_block = parts[0]
+            block_and_after = parts[1].split(END_MARKER)
+            block_content = block_and_after[0]
+            after_block = block_and_after[1]
+
+            cleaned_block_lines = []
+            for line in block_content.splitlines():
+                line_s = line.strip()
+                # Раскомментируем только те мосты, перед которыми мы ставили знак решетки #
+                if line_s.startswith("# Bridge obfs4"):
+                    cleaned_block_lines.append(line_s.replace("# ", "", 1))
+                else:
+                    cleaned_block_lines.append(line)
+
+            restored_block = "\n".join(cleaned_block_lines)
+            final_content = f"{before_block.strip()}\n{START_MARKER}\n{restored_block}\n{END_MARKER}\n{after_block.strip()}\n"
+
+            with open(torrc_path, "w", encoding="utf-8") as f:
+                f.write(final_content)
+            print("[+] All backup bridges successfully uncommented in torrc.")
+    except Exception as e:
+        print(f"[-] Failed to restore torrc bridges during cleanup: {e}")
 
 def detect_firewall_backend():
     if shutil.which("nft"):
@@ -174,8 +319,7 @@ def is_connection_alive(target_url="http://1.1.1.1", timeout=12):
         )
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status < 400
-    except Exception as e:
-        # print(f"[-] Connection check debug: {e}") 
+    except Exception:
         return False
 
 def setup_traffic_tunnel():
@@ -282,6 +426,10 @@ def request_ip_rotation():
     return False
 
 def start_automation_loop(check_interval=15):
+    if os.getuid() != 0:
+        print("[-] Critical Error: This script must be executed with root (sudo) privileges.")
+        sys.exit(1)
+
     if not setup_torrc_config():
         print("[-] Initial Tor configuration failed. Exiting.")
         return
@@ -307,6 +455,9 @@ def start_automation_loop(check_interval=15):
                 print(f"\n[{timestamp}] [!] Connection dropped! Initiating emergency recovery...")
                 
                 clear_traffic_tunnel()
+                
+                print("[*] Rotating bridges from local pool to establish a new circuit...")
+                setup_torrc_config()
                 request_ip_rotation() 
                 
                 if wait_for_tor_circuit(timeout=90):
@@ -322,6 +473,7 @@ def start_automation_loop(check_interval=15):
     finally:
         print("[*] Cleaning up firewall rules before exit...")
         clear_traffic_tunnel()
+        restore_all_bridges_in_torrc()
         print("[+] System network restored to original state.")
 
 if __name__ == "__main__":
