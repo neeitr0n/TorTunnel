@@ -10,6 +10,8 @@ import urllib.error
 import hashlib
 import base64
 
+USE_REMOTE_BRIDGES = True
+
 TOR_HOST = "127.0.0.1"
 TOR_CONTROL_PORT = 9051 
 TOR_SOCKS_PORT = 9050
@@ -18,7 +20,7 @@ TOR_PASSWORD = ""
 TUNNEL_ACTIVATED = False
 FIREWALL_BACKEND = None
 
-BRIDGES_URL = "https://raw.githubusercontent.com/neeitr0n/TorTunnel-bridges/refs/heads/main/bridges_encoded.txt"
+BRIDGES_URL = "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/refs/heads/main/bridge/obfs4_tested.txt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HASH_FILE_PATH = os.path.join(SCRIPT_DIR, "bridges.hash")
 
@@ -60,44 +62,58 @@ def save_local_hash(new_hash):
     except Exception as e:
         print(f"[-] Warning: Failed to save bridge cache hash: {e}")
 
+def process_bridge_payload(raw_payload: bytes) -> list:
+    text_content = ""
+    
+    try:
+        decoded_bytes = base64.b64decode(raw_payload, validate=True)
+        text_content = decoded_bytes.decode('utf-8')
+        print("[*] Payload format detected: Base64. Successfully decoded.")
+    except Exception:
+        text_content = raw_payload.decode('utf-8', errors='ignore')
+        print("[*] Payload format detected: Plain Text.")
+
+    valid_bridges = []
+    
+    for line in text_content.splitlines():
+        line = line.strip()
+        
+        if not line:
+            continue
+
+        if not line.startswith("Bridge "):
+            line = "Bridge " + line
+
+        if not line.startswith("Bridge obfs4"):
+            continue
+            
+        if "8.8.8.8" in line or "10.122." in line:
+            continue
+            
+        valid_bridges.append(line)
+
+    return valid_bridges
+
 def fetch_remote_bridges():
-    print("[*] Connecting to remote repository to verify bridge status...")
+    print("[*] Connecting to remote repository to fetch bridges...")
     try:
         req = urllib.request.Request(BRIDGES_URL, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=15) as response:
-            encoded_content = response.read()
+            raw_content = response.read()
 
-        remote_hash = hashlib.sha256(encoded_content).hexdigest()
+        remote_hash = hashlib.sha256(raw_content).hexdigest()
         local_hash = load_local_hash()
 
         if local_hash == remote_hash:
-            print("[+] Bridge database is up-to-date. No changes detected.")
-            return None, remote_hash
+            print("[+] Bridge database hash matches cache. Processing updated payload structure...")
 
-        if local_hash is None:
-            print("[*] Initial launch or empty cache detected. Fetching bridges...")
-        else:
-            print("[!] Remote bridge database update detected! Syncing...")
-
-        decoded_bytes = base64.b64decode(encoded_content)
-        all_bridges = decoded_bytes.decode('utf-8').splitlines()
-        
-        valid_bridges = []
-        for b in all_bridges:
-            line = b.strip()
-
-            if not line.startswith("Bridge"):
-                continue
-
-            if "8.8.8.8" in line or "10.122." in line:
-                continue
-            valid_bridges.append(line)
+        valid_bridges = process_bridge_payload(raw_content)
 
         if not valid_bridges:
-            print("[-] Error: Failed to parse valid bridge descriptors from the remote payload.")
+            print("[-] Error: Failed to parse valid bridge descriptors. Check payload format.")
             return None, None
 
-        print(f"[+] Successfully decrypted and filtered {len(valid_bridges)} valid bridges into memory.")
+        print(f"[+] Successfully validated {len(valid_bridges)} obfs4 bridges into memory.")
         return valid_bridges, remote_hash
 
     except urllib.error.URLError as e:
@@ -142,11 +158,15 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
             shutil.copyfile(torrc_path, backup_path)
             print(f"[+] Original torrc backup successfully created at: {backup_path}")
 
-        bridges_list, remote_hash = fetch_remote_bridges()
+        bridges_list = None
+        remote_hash = None
 
-        if bridges_list is not None:
-            save_local_hash(remote_hash)
-        else:
+        if USE_REMOTE_BRIDGES:
+            bridges_list, remote_hash = fetch_remote_bridges()
+            if bridges_list is not None:
+                save_local_hash(remote_hash)
+
+        if bridges_list is None:
             if START_MARKER in content:
                 block_content = content.split(START_MARKER)[1].split(END_MARKER)[0]
                 bridges_list = []
@@ -155,7 +175,7 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
                     if line_s.startswith("Bridge obfs4"):
                         bridges_list.append(line_s)
                     elif line_s.startswith("# Bridge obfs4"):
-                        cleaned_bridge = line_s.replace("# [Active] ", "").replace("# ", "", 1)
+                        cleaned_bridge = line_s.replace("# ", "", 1)
                         if cleaned_bridge.startswith("Bridge obfs4"):
                             bridges_list.append(cleaned_bridge)
             else:
@@ -169,16 +189,15 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
 
             for bridge in bridges_list:
                 if bridge in active_set:
-                    # Оставляем активным для Tor
                     bridges_section_lines.append(bridge)
                 else:
-                    # Остальные комментируем, чтобы Tor их не опрашивал при старте
                     bridges_section_lines.append(f"# {bridge}")
             
             bridges_section = "\n" + "\n".join(bridges_section_lines)
             print(f"[+] Activated {len(active_set)} random bridges. {len(bridges_list) - len(active_set)} backup bridges are commented out.")
         else:
             bridges_section = ""
+            print("[-] Warning: Configuration block generated with EMPTY bridge list!")
 
         config_block = (
             f"\n{START_MARKER}\n"
@@ -192,7 +211,7 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
             "VirtualAddrNetworkIPv4 10.192.0.0/10\n"
             "AutomapHostsOnResolve 1\n"
             "UseBridges 1\n"
-            "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy"
+            "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n"
             f"{bridges_section}\n"
             f"{END_MARKER}\n"
         )
@@ -237,7 +256,6 @@ def restore_all_bridges_in_torrc(torrc_path=TORRC_PATH):
             cleaned_block_lines = []
             for line in block_content.splitlines():
                 line_s = line.strip()
-                # Раскомментируем только те мосты, перед которыми мы ставили знак решетки #
                 if line_s.startswith("# Bridge obfs4"):
                     cleaned_block_lines.append(line_s.replace("# ", "", 1))
                 else:
@@ -310,17 +328,32 @@ def wait_for_tor_circuit(timeout=90):
     print("[-] Timeout waiting for Tor circuit.")
     return False
 
-def is_connection_alive(target_url="http://1.1.1.1", timeout=12):
+def is_connection_alive():
+    tor_socket = None
+
     try:
-        req = urllib.request.Request(
-            target_url, 
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0"},
-            method="HEAD"
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return response.status < 400
-    except Exception:
+        tor_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tor_socket.settimeout(7.0)
+        tor_socket.connect((TOR_HOST, TOR_SOCKS_PORT))
+
+        tor_socket.sendall(bytes([0x05, 0x01, 0x00]))
+        response = tor_socket.recv(2)
+
+        if len(response) == 2 and response[1] == 0x00:
+            tor_socket.sendall(bytes([0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x00, 0x50]))
+            success_response = tor_socket.recv(10)
+
+            if len(success_response) == 10 and success_response[1] == 0x00:
+                return True
+
+    except (socket.timeout, socket.error):
         return False
+
+    finally:
+        if tor_socket is not None:
+            tor_socket.close()
+
+    return False
 
 def setup_traffic_tunnel():
     global TUNNEL_ACTIVATED, FIREWALL_BACKEND
@@ -425,26 +458,27 @@ def request_ip_rotation():
     print(f"[-] Tor rejected NEWNYM signal: {err}")
     return False
 
-def start_automation_loop(check_interval=15):
-    if os.getuid() != 0:
-        print("[-] Critical Error: This script must be executed with root (sudo) privileges.")
-        sys.exit(1)
+def start_automation_loop(check_interval=15, retry_count=0):
+    global lock_socket
 
-    if not setup_torrc_config():
-        print("[-] Initial Tor configuration failed. Exiting.")
-        return
+    if retry_count == 0:
+        if not setup_torrc_config():
+            print("[-] Initial Tor configuration failed. Exiting.")
+            return
 
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print("="*65)
-    print("[*] Launching TorTunnel Watchdog Mode (Bridges Compatible).")
-    print(f"[*] Connection monitoring interval: every {check_interval} seconds.")
-    print("[*] Press Ctrl+C to stop and clear firewall rules\n" + "="*65)
-    
-    wait_for_tor_circuit()
-    setup_traffic_tunnel()
-    
-    print("\n[+] Tunnel is ACTIVE. Your traffic is now securely routed through Tor.")
-    print("[*] System status: Operational. Monitoring integrity...")
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print("="*65)
+        print("[*] Launching TorTunnel Watchdog Mode (Bridges Compatible).")
+        print(f"[*] Connection monitoring interval: every {check_interval} seconds.")
+        print("[*] Press Ctrl+C to stop and clear firewall rules\n" + "="*65)
+        
+        wait_for_tor_circuit()
+        setup_traffic_tunnel()
+        print("\n[+] Tunnel is ACTIVE. Your traffic is now securely routed through Tor.")
+        print("[*] System status: Operational. Monitoring integrity...")
+    else:
+        print("\n[+] Kill-Switch is ACTIVE. Traffic is protected by firewall layout.")
+        print(f"[*] Re-checking connection from background spawn...")
 
     try:
         while True:
@@ -453,8 +487,6 @@ def start_automation_loop(check_interval=15):
             if not is_connection_alive():
                 timestamp = time.strftime('%H:%M:%S')
                 print(f"\n[{timestamp}] [!] Connection dropped! Initiating emergency recovery...")
-                
-                clear_traffic_tunnel()
                 
                 print("[*] Rotating bridges from local pool to establish a new circuit...")
                 setup_torrc_config()
@@ -466,15 +498,67 @@ def start_automation_loop(check_interval=15):
                     new_timestamp = time.strftime('%H:%M:%S')
                     print(f"[{new_timestamp}] [+] Connection restored. Tunnel is ACTIVE again.")
                 else:
-                    print(f"[{time.strftime('%H:%M:%S')}] [-] Recovery failed. Retrying in next cycle...")
+                    next_retry = retry_count + 1
+                    print(f"[{time.strftime('%H:%M:%S')}] [-] Recovery failed.")
+                    print(f"[*] Re-spawning script stealthily in background (Next attempt: {next_retry}/3)...")
                     
+                    cmd = f"sleep 2 && {sys.executable} {os.path.abspath(__file__)} --retry-count {next_retry}"
+                    
+                    subprocess.Popen(
+                        cmd,
+                        shell=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True
+                    )
+                    
+                    os._exit(1)
+
     except KeyboardInterrupt:
         print("\n\n[*] Automation stopped by user.")
     finally:
         print("[*] Cleaning up firewall rules before exit...")
         clear_traffic_tunnel()
         restore_all_bridges_in_torrc()
+        if lock_socket:
+            lock_socket.close()
+
         print("[+] System network restored to original state.")
 
 if __name__ == "__main__":
-    start_automation_loop(check_interval=15)
+    if os.getuid() != 0:
+        print("[-] Error: This script must be run as root (via sudo)!")
+        sys.exit(1)
+    
+    retry_count = 0
+    if "--retry-count" in sys.argv:
+        try:
+            idx = sys.argv.index("--retry-count")
+            retry_count = int(sys.argv[idx + 1])
+        except (ValueError, IndexError):
+            pass
+
+    if retry_count >= 3:
+        print(f"\n[{time.strftime('%H:%M:%S')}] [-] Critical: Reached maximum emergency retry limit (3/3).")
+        print("[*] Initiating final safe cleanup to restore user's network...")
+        clear_traffic_tunnel()
+        restore_all_bridges_in_torrc()
+        print("[+] System network restored to original state. Exiting to prevent crash-loop.")
+        sys.exit(1)
+
+    try:
+        lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lock_socket.bind(("127.0.0.1", 65432))        
+        lock_socket.listen(1)
+    except OSError:
+        print("\n[-] Error: Another instance of this script is already running and holding the tunnel!")
+        sys.exit(1)
+
+    if retry_count > 0:
+        print(f"[*] System status: Recovery mode. Active retry attempt: {retry_count}/3")
+    else:
+        print("[*] System status: Operational. Monitoring integrity...")
+
+    start_automation_loop(check_interval=15, retry_count=retry_count)
+
