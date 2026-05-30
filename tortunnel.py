@@ -13,7 +13,7 @@ import base64
 USE_REMOTE_BRIDGES = True
 
 TOR_HOST = "127.0.0.1"
-TOR_CONTROL_PORT = 9051 
+TOR_CONTROL_PORT = 9052
 TOR_SOCKS_PORT = 9050
 TOR_PASSWORD = ""
 
@@ -204,7 +204,7 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
             "SOCKSPort 127.0.0.1:9050\n"
             "TransPort 127.0.0.1:9040\n"
             "DNSPort 127.0.0.1:5353\n"
-            "ControlPort 127.0.0.1:9051\n"
+            "ControlPort 127.0.0.1:9052\n"
             "MaxCircuitDirtiness 30\n"
             "NewCircuitPeriod 15\n"
             "EnforceDistinctSubnets 1\n"
