@@ -10,10 +10,19 @@ import urllib.error
 import hashlib
 import base64
 
+def get_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def kill_all_tor():
+    os.system("sudo systemctl stop tor 2>/dev/null")
+    os.system("sudo pkill -9 tor 2>/dev/null")
+
 USE_REMOTE_BRIDGES = True
 
 TOR_HOST = "127.0.0.1"
-TOR_CONTROL_PORT = 9051
+TOR_CONTROL_PORT = get_free_port()
 TOR_SOCKS_PORT = 9050
 TOR_PASSWORD = ""
 
@@ -204,7 +213,7 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
             "SOCKSPort 127.0.0.1:9050\n"
             "TransPort 127.0.0.1:9040\n"
             "DNSPort 127.0.0.1:5353\n"
-            "ControlPort 127.0.0.1:9051\n"
+            f"ControlPort 127.0.0.1:{TOR_CONTROL_PORT}\n"
             "MaxCircuitDirtiness 30\n"
             "NewCircuitPeriod 15\n"
             "EnforceDistinctSubnets 1\n"
@@ -222,14 +231,17 @@ def setup_torrc_config(torrc_path=TORRC_PATH):
             f.write(final_content)
             
         print("[+] torrc updated successfully. Applying changes...")
-        if run_command(["systemctl", "restart", "tor.service"]):
-            print("[+] Tor service restarted with new configuration.")
-            time.sleep(3)
+        run_command(["systemctl", "stop", "tor.service"], suppress_errors=True)
+        run_command(["pkill", "-9", "tor"], suppress_errors=True)
+        try:
+            subprocess.Popen(["tor", "-f", TORRC_PATH], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("Tor standalone process spawned successfully.")
+            time.sleep(5)
             return True
-        else:
-            print("[-] Failed to restart Tor service via systemctl.")
+        except Exception as e:
+            print(f"[-] Failed to start Tor standalone: {e}")
             return False
-            
+
     except PermissionError:
         print("[-] Permission denied. Please run the script with sudo (needed to modify torrc).")
         return False
@@ -460,6 +472,7 @@ def request_ip_rotation():
 
 def start_automation_loop(check_interval=15, retry_count=0):
     global lock_socket
+    kill_all_tor()
 
     if retry_count == 0:
         if not setup_torrc_config():
@@ -561,4 +574,3 @@ if __name__ == "__main__":
         print("[*] System status: Operational. Monitoring integrity...")
 
     start_automation_loop(check_interval=15, retry_count=retry_count)
-
